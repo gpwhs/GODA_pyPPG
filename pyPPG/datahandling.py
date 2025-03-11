@@ -137,7 +137,60 @@ def load_data(data_path = "", fs = np.nan, start_sig = 0, end_sig = -1, channel=
     s.name=rec_name
 
     return s
+def load_data_from_dataframe(input_sig, fs = np.nan, start_sig = 0, end_sig = -1, channel='Pleth', use_tk=True, print_flag=True):
+    """
+    Load raw PPG data.
 
+    :param input_sig: numpy array of the ppg signal
+    :type input_sig: np.array
+    :param start_sig: the first sample of the signal to be analysed
+    :type start_sig: int
+    :param fs: the sampling frequency of the PPG in Hz
+    :type fs: int
+    :param end_sig: the last sample of the signal to be analysed
+    :type end_sig: int
+    :param channel: channel of the .edf file
+    :type channel: channel of the .edf file
+    :param use_tk: a bool for using tkinter interface
+    :type use_tk: bool
+    :param print_flag: a bool for print message
+    :type print_flag: bool
+
+    :return: s: dictionary of the PPG signal:
+
+        * s.start_sig: the first sample of the signal to be analysed
+        * s.end_sig: the last sample of the signal to be analysed
+        * s.v: a vector of PPG values
+        * s.fs: the sampling frequency of the PPG in Hz
+        * s.name: name of the record
+        * s.v: 1-d array, a vector of PPG values
+        * s.fs: the sampling frequency of the PPG in Hz
+        * s.ppg: 1-d array, a vector of the filtered PPG values
+        * s.vpg: 1-d array, a vector of the filtered PPG' values
+        * s.apg: 1-d array, a vector of the filtered PPG" values
+        * s.jpg: 1-d array, a vector of the filtered PPG'" values
+        * s.filtering: a bool for filtering
+        * s.correct: a bool for correcting fiducial points
+    """
+
+    sig = input_sig
+    s = DotMap()
+
+    s.start_sig = start_sig
+    if start_sig<end_sig:
+        s.end_sig = end_sig
+    else:
+        s.end_sig = len(sig)
+
+    try:
+        s.v=sig[s.start_sig:s.end_sig]
+    except:
+        raise('There is no valid PPG signal!')
+
+    s.fs=fs
+    s.name='test'
+
+    return s
 ###########################################################################
 ########################### Plot Fiducial points ##########################
 ###########################################################################
