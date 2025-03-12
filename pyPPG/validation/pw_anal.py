@@ -1,6 +1,13 @@
 import copy
+import gc
+import pprint
 import os
 import pickle
+import sys
+import json
+
+sys.path.insert(0, "/Users/george/Documents/PhD/GODA_pyppg")
+
 
 import pandas as pd
 from scipy.interpolate import interp1d
@@ -1007,7 +1014,7 @@ class PulseWaveAnal:
 
         ## Loading a raw PPG signal
         signal = load_data(data_path=data_path)
-        signal.fs=250
+        signal.fs = 250
 
         ## Preprocessing
         # Initialise the filters
@@ -1075,23 +1082,232 @@ class PulseWaveAnal:
 
         return s, det_fp, bm
 
+    def extract_pw_feat_from_parquet_optimized(
+        self, dataframe, savingfolder, correction, savefig, show_fig
+    ):
+        """
+        Optimized version of extract_pw_feat_from_parquet to handle large dataframes efficiently.
+        """
+        # Constants for batch processing
+        BATCH_SIZE = 100  # Process this many records at once
+
+        # Lists to collect results (more efficient than growing DataFrames)
+        all_fp_list = []
+        all_bm_vals_dict = {}
+        bm_defs = None
+
+        # Get the number of records to process
+        number_of_rec = len(dataframe["ppg"])
+
+        # Process in batches
+        for batch_start in tqdm(
+            range(0, number_of_rec, BATCH_SIZE), desc="Processing batches"
+        ):
+            # Define batch end (handle the last batch properly)
+            batch_end = min(batch_start + BATCH_SIZE, number_of_rec)
+
+            # Process each record in the batch
+            for i in range(batch_start, batch_end):
+                try:
+                    # Extract current signal
+                    signal = dataframe["ppg"][i]
+
+                    # Process the signal
+                    s, fp, bm = self._process_single_signal(
+                        signal=signal,
+                        filtering=True,
+                        fL=0,
+                        fH=12,
+                        order=4,
+                        sm_wins={"ppg": 50, "vpg": 10, "apg": 10, "jpg": 10},
+                        correction=correction,
+                        savefig=savefig,
+                        savingfolder=savingfolder,
+                        show_fig=show_fig,
+                    )
+
+                    # Store the biomarker definitions if not already stored
+                    if bm_defs is None and bm is not None:
+                        bm_defs = bm.bm_defs
+
+                    # Add to result collections if processing was successful
+                    if fp is not None and not fp.empty:
+                        # Store fiducial points with record index
+                        fp_copy = fp.copy()
+                        fp_copy["record_idx"] = i
+                        all_fp_list.append(fp_copy)
+
+                        # Initialize biomarker dictionaries if needed
+                        if bm is not None:
+                            for bm_key in bm.bm_vals.keys():
+                                if bm_key not in all_bm_vals_dict:
+                                    all_bm_vals_dict[bm_key] = []
+
+                                # Add biomarker values with record index
+                                if not bm.bm_vals[bm_key].empty:
+                                    bm_val_copy = bm.bm_vals[bm_key].copy()
+                                    bm_val_copy["record_idx"] = i
+                                    all_bm_vals_dict[bm_key].append(bm_val_copy)
+
+                except Exception as e:
+                    print(f"Error processing record {i}: {str(e)}")
+
+            # Force garbage collection after each batch
+            plt.close("all")  # Close all matplotlib figures
+            gc.collect()  # Run garbage collection
+
+        # Combine all fiducial points
+        print("Combining results...")
+        all_fp = (
+            pd.concat(all_fp_list, ignore_index=True) if all_fp_list else pd.DataFrame()
+        )
+
+        # Combine all biomarker values
+        all_bm_vals = {}
+        for bm_key in all_bm_vals_dict:
+            all_bm_vals[bm_key] = (
+                pd.concat(all_bm_vals_dict[bm_key], ignore_index=True)
+                if all_bm_vals_dict[bm_key]
+                else pd.DataFrame()
+            )
+
+        # Calculate statistics if we have data
+        if not all_fp.empty:
+            print("Calculating statistics...")
+            all_fp.index = range(len(all_fp))
+            for bm_key in all_bm_vals:
+                all_bm_vals[bm_key].index = range(len(all_bm_vals[bm_key]))
+
+            bm_stats = get_statistics(all_fp.sp, all_fp.on, all_bm_vals)
+
+            # Create return objects
+            BMs = Biomarkers(bm_defs=bm_defs, bm_vals=all_bm_vals, bm_stats=bm_stats)
+            FPs = Fiducials(fp=all_fp)
+        else:
+            print("No valid results to process")
+            BMs, FPs = None, None
+
+        # Final cleanup
+        gc.collect()
+
+        return BMs, FPs
+
+    def _process_single_signal(
+        self,
+        signal,
+        filtering=True,
+        fL=0,
+        fH=12,
+        order=4,
+        sm_wins={"ppg": 50, "vpg": 10, "apg": 10, "jpg": 10},
+        correction=pd.DataFrame(),
+        savefig=False,
+        savingfolder="",
+        show_fig=False,
+    ):
+        """
+        Process a single PPG signal with optimizations.
+        This is an internal helper function to be called from batch processing.
+        """
+        try:
+            # Load data efficiently
+            signal = load_data_from_dataframe(signal)
+            signal.fs = 250
+
+            # Initialize preprocessor (could be cached as class attribute for further optimization)
+            prep = PP.Preprocess(fL=fL, fH=fH, order=order, sm_wins=sm_wins)
+
+            # Process signals
+            signal.filtering = filtering
+            signal.ppg, signal.vpg, signal.apg, signal.jpg = prep.get_signals(s=signal)
+
+            # Create PPG class
+            signal.correction = correction
+            s = PPG(signal, check_ppg_len=False)
+
+            # Create fiducial class
+            fpex = FP.FpCollection(s)
+
+            # Extract fiducial points efficiently
+            ppg_fp = pd.DataFrame()
+            ppg_fp["on"] = [0]
+            ppg_fp["off"] = [len(signal.ppg) - 1]
+            ppg_fp["sp"] = [np.argmax(signal.ppg)]
+
+            peak = [ppg_fp.sp.iloc[0]]
+            onsets = [ppg_fp.on.iloc[0], ppg_fp.off.iloc[0]]
+
+            # Calculate dicrotic notch only once
+            dicrotic_notch = np.array(fpex.get_dicrotic_notch(peak, onsets))
+            ppg_fp["dn"] = dicrotic_notch
+
+            # Extract other fiducial points
+            vpg_fp = fpex.get_vpg_fiducials(onsets)
+            apg_fp = fpex.get_apg_fiducials(onsets, peak)
+            jpg_fp = fpex.get_jpg_fiducials(onsets, apg_fp)
+
+            ppg_fp["dp"] = fpex.get_diastolic_peak(onsets, ppg_fp.dn, apg_fp.e)
+
+            # Merge fiducials
+            det_fp = self.merge_fiducials(ppg_fp, vpg_fp, apg_fp, jpg_fp)
+
+            # Apply corrections if needed
+            if bool(len(correction)):
+                det_fp = fpex.correct_fiducials(fiducials=det_fp, correction=correction)
+
+            # Clean up NaN values and convert to integers
+            det_fp = det_fp.fillna(0).astype(int)
+
+            # Create a copy with an additional row for biomarker calculation
+            det_fp_new = pd.concat(
+                [det_fp, pd.DataFrame({"on": [ppg_fp.off.iloc[0]]})], ignore_index=True
+            )
+            det_fp_new = det_fp_new.fillna(0).astype(int)
+            det_fp_new.index = [0, 1]
+
+            # Plot fiducial points if requested (typically disable in batch mode)
+            if savefig or show_fig:
+                plot_fiducials(
+                    s=s,
+                    fp=det_fp,
+                    savefig=savefig,
+                    savingfolder=savingfolder,
+                    show_fig=show_fig,
+                    print_flag=False,
+                    legend_fontsize=9,
+                    marker_size=90,
+                    use_tk=False,
+                )
+                # Close figure to prevent memory leaks
+                plt.close("all")
+
+            # Calculate biomarkers
+            bm = self.get_pw_bm(s=s, fp=det_fp_new)
+
+            return s, det_fp, bm
+
+        except Exception as e:
+            print(f"Error in signal processing: {str(e)}")
+            # Return empty/default values to continue processing other signals
+            return None, pd.DataFrame(), None
+
     def pw_extraction_from_parquet(
-            self,
-            signal,
-            filtering=True,
-            fL=0,
-            fH=12,
-            order=4,
-            sm_wins={"ppg": 50, "vpg": 10, "apg": 10, "jpg": 10},
-            correction=pd.DataFrame(),
-            savefig=True,
-            savingfolder="",
-            show_fig=False,
-            print_flag=True,
+        self,
+        signal,
+        filtering=True,
+        fL=0,
+        fH=12,
+        order=4,
+        sm_wins={"ppg": 50, "vpg": 10, "apg": 10, "jpg": 10},
+        correction=pd.DataFrame(),
+        savefig=True,
+        savingfolder="",
+        show_fig=False,
+        print_flag=True,
     ):
 
         signal = load_data_from_dataframe(signal)
-        signal.fs=250
+        signal.fs = 250
 
         ## Preprocessing
         # Initialise the filters
@@ -1158,6 +1374,7 @@ class PulseWaveAnal:
         bm = self.get_pw_bm(s=s, fp=det_fp_new)
 
         return s, det_fp, bm
+
     ###########################################################################
     ###################### Extract Pulse Wave Biomarkers  #####################
     ###########################################################################
@@ -1232,15 +1449,17 @@ class PulseWaveAnal:
             print_flag=True,
         )
 
-    def extract_pw_feat_from_parquet(self, dataframe, savingfolder, correction, savefig, show_fig):
+    def extract_pw_feat_from_parquet(
+        self, dataframe, savingfolder, correction, savefig, show_fig
+    ):
 
         all_fp = pd.DataFrame()
         all_bm_vals = {}
-        number_of_rec = len(dataframe['ppg'])
+        number_of_rec = len(dataframe["ppg"])
         for i in tqdm(range(0, number_of_rec)):
-            name = dataframe['eid_visit']
+            name = dataframe["eid_visit"]
             s, fp, bm = self.pw_extraction_from_parquet(
-                signal = dataframe['ppg'][i],
+                signal=dataframe["ppg"][i],
                 filtering=True,
                 fL=0,
                 fH=12,
@@ -1252,7 +1471,6 @@ class PulseWaveAnal:
                 show_fig=show_fig,
                 print_flag=False,
             )
-
 
             all_fp = pd.concat([all_fp, fp])
 
@@ -1284,6 +1502,7 @@ class PulseWaveAnal:
         #     print_flag=True,
         # )
         return BMs, FPs
+
     ###########################################################################
     ########################### Evaluation of PPG-BP  #########################
     ###########################################################################
@@ -1355,10 +1574,12 @@ class PulseWaveAnal:
 
     def run_pw_extraction_from_parquet(self, dataframe, correction):
         savingfolder = "temp_dir" + os.sep + "PW_anal_01"
-        bms, fps = self.extract_pw_feat_from_parquet(
+        bms, fps = self.extract_pw_feat_from_parquet_optimized(
             dataframe, savingfolder, correction, savefig=False, show_fig=False
         )
+
         return bms, fps
+
     ###########################################################################
     #############################  Run Benchmarking  ##########################
     ###########################################################################
@@ -1412,7 +1633,6 @@ if __name__ == "__main__":
         + str(date.minute)
     )
 
-
     def resample_ppg(ppg_signal, heart_rate, target_fs=250):
         """
         Resamples a PPG signal to target_fs (default 250Hz).
@@ -1456,13 +1676,16 @@ if __name__ == "__main__":
         resampled_signal = interpolator(t_resampled)
 
         return resampled_signal
+
     # Extract Pulse Wave Features
-    data = pd.read_parquet(f"{os.getenv('BIOBANK_DATA_PATH')}/250k_waves_and_conditions.parquet")
+
+    data = pd.read_parquet(
+        f"{os.getenv('BIOBANK_DATA_PATH')}/250k_waves_and_conditions.parquet"
+    )
     data = data.dropna()
-    # need to resample every signal in data['ppg'] to 250Hz using the corresponding HR from data['HR']
-    data['ppg'] = data.apply(lambda x: resample_ppg(x['ppg'], x['HR']), axis=1)
+    data.reset_index(drop=True, inplace=True)
+    data["ppg"] = data.apply(lambda row: resample_ppg(row["ppg"], row["HR"]), axis=1)
     bm, fp = pwex.run_pw_extraction_from_parquet(data, correction)
     with open("bm_fp.pkl", "wb") as f:
         pickle.dump((bm, fp), f)
-
-    print("End of analysis!")
+    print("End!")
